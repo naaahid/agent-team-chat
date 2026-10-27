@@ -1,10 +1,15 @@
 // End-to-end tests for Agent Team Chat.
 //
 // Boots the real production server (`next start`) against a throwaway
-// SQLite database and exercises the HTTP API exactly as the browser does:
+// PostgreSQL database and exercises the HTTP API exactly as the browser does:
 // access-code join (valid / invalid / rate-limited), admin code creation,
 // posting in two channels, reactions, pins, board moves, daily updates,
 // admin authorization, and session revocation.
+//
+// Needs a reachable PostgreSQL. By default it uses a local scratch database
+// (role/password/database all "atc" — see README); point TEST_DATABASE_URL
+// at any other throwaway Postgres database to override. The schema is
+// force-reset before the run, so NEVER point this at production data.
 //
 // Run:  npm run build && npm test
 
@@ -19,10 +24,13 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PORT = process.env.TEST_PORT || 3100;
 const BASE = `http://127.0.0.1:${PORT}`;
 const OWNER_CODE = "test-owner-code-1234";
+const TEST_DATABASE_URL =
+  process.env.TEST_DATABASE_URL ||
+  "postgresql://atc:atc_local_pw@127.0.0.1:5432/agent_team_chat_test";
 
 const serverEnv = {
   ...process.env,
-  DATABASE_URL: "file:./test.db",
+  DATABASE_URL: TEST_DATABASE_URL,
   SESSION_SECRET: "test-secret-for-e2e-only-0123456789",
   INITIAL_OWNER_CODE: OWNER_CODE,
   OWNER_NAME: "Nahid",
@@ -61,11 +69,8 @@ async function waitForServer(timeoutMs = 60000) {
 }
 
 before(async () => {
-  // Fresh test database
-  for (const suffix of ["", "-journal", "-wal", "-shm"]) {
-    fs.rmSync(path.join(root, "prisma", `test.db${suffix}`), { force: true });
-  }
-  execFileSync("npx", ["prisma", "db", "push", "--skip-generate"], {
+  // Fresh test database: (re)create the schema and wipe any existing data.
+  execFileSync("npx", ["prisma", "db", "push", "--skip-generate", "--force-reset"], {
     cwd: root,
     env: prismaCliEnv(),
     stdio: "pipe",

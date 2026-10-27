@@ -14,9 +14,18 @@ Nahid is the **Owner**. His Muse agent is **Mula**. The other two friends and th
 
 ---
 
-## Run it (Windows, Mac or Linux)
+## Run it on your own computer (Windows, Mac or Linux)
 
-You need **Node.js 20+** installed. Then, in this folder:
+You need **Node.js 20+** installed, and a **PostgreSQL database** the app can
+reach — the easiest is a free database at [neon.tech](https://neon.tech) (see
+"Deploy it online" below; you can use the same Neon database, or a separate
+free Neon "dev branch", for local runs too). A PostgreSQL installed on your
+own computer works fine as well.
+
+1. Copy `.env.example` to a new file named `.env` and put your database
+   connection string in it as `DATABASE_URL` (plus a long random
+   `SESSION_SECRET`).
+2. Then, in this folder:
 
 ```bat
 npm install
@@ -28,10 +37,17 @@ npm start
 Open **http://localhost:3000** in your browser.
 
 - `npm install` — downloads everything (first time only)
-- `npm run setup` — creates the local database (`prisma/dev.db`)
+- `npm run setup` — creates the tables in your database
 - `npm run build` — builds the app (run again after any code change)
 - `npm start` — starts the app. Keep this window open while using it.
   For development with auto-reload, use `npm run dev` instead of build+start.
+
+> **Prefer a simple local file instead of PostgreSQL?** For a purely local,
+> single-computer run you can switch back to SQLite: in
+> `prisma/schema.prisma` change the datasource `provider` to `"sqlite"` and
+> set `DATABASE_URL="file:./dev.db"` in `.env`, then run `npm run setup`
+> again. (Hosted servers like Vercel cannot keep a SQLite file, so the
+> online version always uses PostgreSQL.)
 
 ## First login — the Owner code
 
@@ -81,15 +97,50 @@ Suggested seats for the full team:
 
 Assign the ⭐ **Leader** badge to any one agent (or human) from Admin when the team decides. Only one Leader at a time.
 
-## Important: friends can only join if the app is reachable
+## Deploy it online (Vercel + Neon) — so friends can join
 
-This app runs on **one computer** with a local SQLite file database. If it runs only on your PC, only you can open it. For your friends (and their agents) to join from their own homes, the app must be **hosted on a public server/VPS** later — same code, just running on an always-on machine with a public address. The database can be switched from SQLite to PostgreSQL by changing one line (`provider`) in `prisma/schema.prisma` and setting `DATABASE_URL` in `.env`.
+If the app runs only on your PC, only you can open it. To let your friends
+(and their agents) join from their own homes, put it on the internet. The
+free way is **Vercel** (runs the app) + **Neon** (free PostgreSQL database).
+The app is already prepared for this — the database provider in
+`prisma/schema.prisma` is `postgresql`.
+
+1. **Create the database:** sign up at [neon.tech](https://neon.tech),
+   create a project, and copy its **connection string** (it starts with
+   `postgresql://`). That is your production `DATABASE_URL`.
+2. **Create the tables (one time only):** on your computer, in this folder,
+   run this once with the Neon connection string in `.env` as
+   `DATABASE_URL`:
+
+   ```bat
+   npx prisma db push
+   ```
+
+   (The app does **not** do this by itself on every start — just this once,
+   and again only if the database layout ever changes.)
+3. **Create the app on Vercel:** sign up at [vercel.com](https://vercel.com)
+   with your GitHub account, choose **Add New → Project**, and import this
+   repository (`naaahid/agent-team-chat`). Vercel detects Next.js by itself;
+   the build command (`npm run build`) already includes `prisma generate`.
+4. **Set these environment variables** in the Vercel project
+   (Settings → Environment Variables) before the first deploy:
+
+   | Variable | Value |
+   | --- | --- |
+   | `DATABASE_URL` | the Neon connection string from step 1 |
+   | `SESSION_SECRET` | a brand-new long random text (do **not** reuse the one from your computer) |
+   | `INITIAL_OWNER_CODE` | your first Owner code, e.g. `nahid-owner-2026` (change it later in Admin) |
+   | `OWNER_NAME` | `Nahid` |
+
+5. **Deploy.** Vercel gives you a public web address
+   (like `agent-team-chat.vercel.app`). Open it, join with your Owner
+   code, and send that address + their personal codes to your friends.
 
 ## Settings (`.env`)
 
 | Variable | What it does |
 | --- | --- |
-| `DATABASE_URL` | Database location. Default `file:./dev.db` (SQLite file in `prisma/`) |
+| `DATABASE_URL` | PostgreSQL connection string, e.g. `postgresql://user:password@host:5432/dbname` (Neon in production) |
 | `SESSION_SECRET` | Signs the login cookies. **Change this** to a long random text before real use |
 | `INITIAL_OWNER_CODE` | The first Owner code, used only when the Owner seat is created |
 | `OWNER_NAME` | Name of the Owner seat (default `Nahid`) |
@@ -97,7 +148,7 @@ This app runs on **one computer** with a local SQLite file database. If it runs 
 
 ## Tests
 
-Automated end-to-end tests boot the real server against a throwaway database and check the join flow (valid code, wrong code, rate-limit lockout), admin permissions, messages in two channels, reactions, pins, board moves, daily updates, leader assignment and session revocation:
+Automated end-to-end tests boot the real server against a throwaway PostgreSQL database and check the join flow (valid code, wrong code, rate-limit lockout), admin permissions, messages in two channels, reactions, pins, board moves, daily updates, leader assignment and session revocation. The tests expect a local PostgreSQL with role `atc` / password `atc_local_pw` / database `agent_team_chat_test` (or set `TEST_DATABASE_URL` to any throwaway Postgres database — it gets wiped):
 
 ```bat
 npm run build
@@ -106,4 +157,4 @@ npm test
 
 ## Tech
 
-Next.js (App Router) + TypeScript + Tailwind CSS · Prisma ORM + SQLite · Sessions are signed JWT cookies backed by revocable server-side session rows · Access codes stored as bcrypt hashes.
+Next.js (App Router) + TypeScript + Tailwind CSS · Prisma ORM + PostgreSQL (Neon) · Sessions are signed JWT cookies backed by revocable server-side session rows · Access codes stored as bcrypt hashes.

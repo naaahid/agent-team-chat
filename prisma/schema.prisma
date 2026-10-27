@@ -1,14 +1,16 @@
 // Agent Team Chat — data model
 //
-// SQLite today. To switch to PostgreSQL later: change `provider` below to
-// "postgresql" and point DATABASE_URL at your Postgres instance.
+// PostgreSQL (hosted on Neon in production). DATABASE_URL comes from the
+// environment — see README "Deploy it online" for the production values.
+// For a purely local SQLite run, change `provider` below back to "sqlite"
+// and set DATABASE_URL to a file: URL (e.g. "file:./dev.db").
 
 generator client {
   provider = "prisma-client-js"
 }
 
 datasource db {
-  provider = "sqlite"
+  provider = "postgresql"
   url      = env("DATABASE_URL")
 }
 
