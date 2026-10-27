@@ -1,0 +1,112 @@
+// Agent Team Chat — data model
+//
+// SQLite today. To switch to PostgreSQL later: change `provider` below to
+// "postgresql" and point DATABASE_URL at your Postgres instance.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+/// A seat is one identity in the team: a human or a Muse agent.
+/// People join the app by entering the access code attached to a seat.
+model Seat {
+  id         Int         @id @default(autoincrement())
+  name       String
+  kind       String // "human" | "agent"
+  role       String // "Owner" | "Leader" | "Member"
+  color      String // hex color used for the name/avatar
+  avatar     String // emoji avatar
+  joinedAt   DateTime? // set on first successful join
+  lastSeenAt DateTime?
+  createdAt  DateTime    @default(now())
+
+  code       AccessCode?
+  sessions   Session[]
+  messages   Message[]
+  reactions  Reaction[]
+  cards      BoardCard[]  @relation("CardProposer")
+  updates    DailyUpdate[]
+}
+
+/// The secret access code for a seat. Only the bcrypt hash is stored.
+model AccessCode {
+  id         Int       @id @default(autoincrement())
+  seatId     Int       @unique
+  seat       Seat      @relation(fields: [seatId], references: [id], onDelete: Cascade)
+  codeHash   String
+  revoked    Boolean   @default(false)
+  createdAt  DateTime  @default(now())
+  lastUsedAt DateTime?
+}
+
+/// A signed-in browser session. Revoking rows here logs the member out.
+model Session {
+  id        String   @id // jti stored inside the JWT
+  seatId    Int
+  seat      Seat     @relation(fields: [seatId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+  expiresAt DateTime
+  revoked   Boolean  @default(false)
+}
+
+model Channel {
+  id        Int       @id @default(autoincrement())
+  slug      String    @unique // e.g. "general"
+  name      String // e.g. "general" (shown as #general)
+  topic     String    @default("")
+  createdBy Int?
+  createdAt DateTime  @default(now())
+  messages  Message[]
+}
+
+model Message {
+  id        Int        @id @default(autoincrement())
+  channelId Int
+  channel   Channel    @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  authorId  Int?
+  author    Seat?      @relation(fields: [authorId], references: [id], onDelete: SetNull)
+  kind      String     @default("user") // "user" | "system"
+  body      String
+  pinned    Boolean    @default(false)
+  editedAt  DateTime?
+  createdAt DateTime   @default(now())
+  reactions Reaction[]
+
+  @@index([channelId, id])
+}
+
+model Reaction {
+  id        Int     @id @default(autoincrement())
+  messageId Int
+  message   Message @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  seatId    Int
+  seat      Seat    @relation(fields: [seatId], references: [id], onDelete: Cascade)
+  emoji     String
+
+  @@unique([messageId, seatId, emoji])
+}
+
+model BoardCard {
+  id           Int      @id @default(autoincrement())
+  title        String
+  description  String   @default("")
+  column       String // "idea" | "discussing" | "decided" | "in_progress" | "done"
+  position     Int      @default(0)
+  proposedById Int?
+  proposedBy   Seat?    @relation("CardProposer", fields: [proposedById], references: [id], onDelete: SetNull)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+}
+
+model DailyUpdate {
+  id        Int      @id @default(autoincrement())
+  authorId  Int?
+  author    Seat?    @relation(fields: [authorId], references: [id], onDelete: SetNull)
+  body      String
+  createdAt DateTime @default(now())
+}
