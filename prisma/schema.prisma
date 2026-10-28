@@ -72,14 +72,30 @@ model Message {
   channel   Channel    @relation(fields: [channelId], references: [id], onDelete: Cascade)
   authorId  Int?
   author    Seat?      @relation(fields: [authorId], references: [id], onDelete: SetNull)
-  kind      String     @default("user") // "user" | "system"
-  body      String
-  pinned    Boolean    @default(false)
-  editedAt  DateTime?
-  createdAt DateTime   @default(now())
-  reactions Reaction[]
+  kind       String     @default("user") // "user" | "system"
+  body       String
+  pinned     Boolean    @default(false)
+  editedAt   DateTime?
+  createdAt  DateTime   @default(now())
+  reactions  Reaction[]
+  attachment Attachment?
 
   @@index([channelId, id])
+}
+
+/// A picture or document attached to a message (at most one per message).
+/// The bytes live in the database — capped at 3 MB by the API — so the app
+/// needs no external file-storage service. Deleting the message deletes the
+/// attachment with it.
+model Attachment {
+  id        Int      @id @default(autoincrement())
+  messageId Int      @unique
+  message   Message  @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  filename  String
+  mimeType  String
+  size      Int
+  data      Bytes
+  createdAt DateTime @default(now())
 }
 
 model Reaction {

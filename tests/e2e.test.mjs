@@ -115,6 +115,28 @@ function client(ip) {
   };
 }
 
+/** Like client(), but returns the raw fetch Response (bytes + headers). */
+function rawClient(ip) {
+  const jar = new Map();
+  return async function callRaw(method, url, body) {
+    const headers = { "x-forwarded-for": ip };
+    if (body !== undefined) headers["Content-Type"] = "application/json";
+    const cookie = [...jar.entries()].map(([k, v]) => `${k}=${v}`).join("; ");
+    if (cookie) headers["Cookie"] = cookie;
+    const res = await fetch(`${BASE}${url}`, {
+      method,
+      headers,
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+    });
+    for (const sc of res.headers.getSetCookie ? res.headers.getSetCookie() : []) {
+      const [pair] = sc.split(";");
+      const eq = pair.indexOf("=");
+      if (eq > 0) jar.set(pair.slice(0, eq).trim(), pair.slice(eq + 1).trim());
+    }
+    return res;
+  };
+}
+
 const owner = client("10.0.0.2");
 const member = client("10.0.0.3");
 let memberCode = "";
@@ -298,6 +320,78 @@ test("channel history windows: latest default, before-cursor, after-cursor", asy
   assert.deepEqual(none.json.messages, []);
   const newer = await owner("GET", `/api/channels/${chId}/messages?after=${allIds[7]}`);
   assert.deepEqual(newer.json.messages.map((m) => m.id), allIds.slice(8));
+});
+
+test("attachments: image-only message, byte download, text file, oversize, auth", async () => {
+  // 1x1 transparent PNG.
+  const PNG_B64 =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+  const pngBytes = Buffer.from(PNG_B64, "base64");
+
+  const raw = rawClient("10.0.0.77");
+  const join = await raw("POST", "/api/auth/join", { code: memberCode });
+  assert.equal(join.status, 200);
+  await join.arrayBuffer().catch(() => null);
+
+  // (a) A message with ONLY an image attachment (no body) is accepted, and
+  // its DTO carries attachment metadata — never the bytes.
+  const posted = await owner("POST", `/api/channels/${generalId}/messages`, {
+    attachment: { filename: "dot.png", mimeType: "image/png", dataBase64: PNG_B64 },
+  });
+  assert.equal(posted.status, 201);
+  assert.equal(posted.json.message.body, "");
+  const att = posted.json.message.attachment;
+  assert.ok(att, "DTO carries attachment metadata");
+  assert.equal(att.filename, "dot.png");
+  assert.equal(att.mimeType, "image/png");
+  assert.equal(att.size, pngBytes.length);
+  assert.equal(att.data, undefined);
+  assert.equal(att.dataBase64, undefined);
+
+  // The channel message list carries the same metadata.
+  const feed = await owner("GET", `/api/channels/${generalId}/messages`);
+  const listed = feed.json.messages.find((m) => m.id === posted.json.message.id);
+  assert.equal(listed.attachment.id, att.id);
+
+  // (b) The attachment downloads byte-for-byte, inline for images.
+  const dl = await raw("GET", `/api/attachments/${att.id}`);
+  assert.equal(dl.status, 200);
+  assert.match(dl.headers.get("content-type") || "", /image\/png/);
+  assert.match(dl.headers.get("content-disposition") || "", /inline/);
+  const got = Buffer.from(await dl.arrayBuffer());
+  assert.ok(got.equals(pngBytes), "downloaded bytes match the uploaded PNG");
+
+  // (c) A text file WITH a body keeps both; non-image types download.
+  const note = Buffer.from("hello team — attachment note", "utf8");
+  const posted2 = await owner("POST", `/api/channels/${generalId}/messages`, {
+    body: "See the attached note",
+    attachment: { filename: "note.txt", mimeType: "text/plain", dataBase64: note.toString("base64") },
+  });
+  assert.equal(posted2.status, 201);
+  assert.equal(posted2.json.message.body, "See the attached note");
+  const att2 = posted2.json.message.attachment;
+  assert.equal(att2.filename, "note.txt");
+  const dl2 = await raw("GET", `/api/attachments/${att2.id}`);
+  assert.equal(dl2.status, 200);
+  assert.match(dl2.headers.get("content-disposition") || "", /^attachment/);
+  assert.ok(Buffer.from(await dl2.arrayBuffer()).equals(note));
+
+  // (d) Over the 3 MB cap → 4xx, nothing stored.
+  const big = Buffer.alloc(3 * 1024 * 1024 + 1, 7).toString("base64");
+  const tooBig = await owner("POST", `/api/channels/${generalId}/messages`, {
+    body: "too big",
+    attachment: { filename: "big.bin", mimeType: "application/octet-stream", dataBase64: big },
+  });
+  assert.ok(
+    tooBig.status >= 400 && tooBig.status < 500,
+    `oversize rejected with a 4xx, got ${tooBig.status}`
+  );
+
+  // (e) Downloads require a signed-in seat; unknown ids 404.
+  const anon = await fetch(`${BASE}/api/attachments/${att.id}`);
+  assert.equal(anon.status, 401);
+  const missing = await raw("GET", "/api/attachments/99999999");
+  assert.equal(missing.status, 404);
 });
 
 test("owner can assign the Leader badge", async () => {

@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/db";
 import { requireSeat } from "@/lib/guard";
-import { toMessageDTO } from "@/lib/serialize";
+import { MESSAGE_INCLUDE, toMessageDTO } from "@/lib/serialize";
 
 type Params = { params: Promise<{ id: string }> };
 
@@ -15,7 +15,7 @@ export async function POST(_req: Request, { params }: Params) {
   const updated = await prisma.message.update({
     where: { id },
     data: { pinned: !message.pinned },
-    include: { author: true, reactions: true },
+    include: MESSAGE_INCLUDE,
   });
   return NextResponse.json({ message: toMessageDTO(updated, seat.id) });
 }

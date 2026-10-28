@@ -6,6 +6,12 @@ import { Avatar, RoleBadge, formatDay, formatTime } from "./Avatar";
 import type { Channel } from "./AppShell";
 
 type Reaction = { emoji: string; count: number; mine: boolean };
+export type ChatAttachment = {
+  id: number;
+  filename: string;
+  mimeType: string;
+  size: number;
+};
 export type ChatMessage = {
   id: number;
   channelId: number;
@@ -14,6 +20,7 @@ export type ChatMessage = {
   pinned: boolean;
   editedAt: string | null;
   createdAt: string;
+  attachment: ChatAttachment | null;
   author: {
     id: number;
     name: string;
@@ -26,6 +33,29 @@ export type ChatMessage = {
 };
 
 const EMOJIS = ["👍", "❤️", "🔥", "😂", "👀"];
+
+// Attachments: one file per message, 3 MB max (enforced here and on the
+// server — files travel base64-encoded inside the JSON request body).
+const MAX_ATTACHMENT_BYTES = 3 * 1024 * 1024;
+const ACCEPT_TYPES = "image/*,.pdf,.txt,.md,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.zip";
+
+function formatSize(bytes: number) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+}
+
+function readAsBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = String(reader.result ?? "");
+      resolve(result.slice(result.indexOf(",") + 1));
+    };
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(file);
+  });
+}
 
 // History page size: opening a channel loads the latest PAGE_SIZE messages;
 // scrolling to the top auto-loads the previous window of the same size.
@@ -53,7 +83,12 @@ export function ChatView({ channel }: { channel: Channel }) {
   const [editingId, setEditingId] = useState<number | null>(null);
   const [editText, setEditText] = useState("");
   const [hoverId, setHoverId] = useState<number | null>(null);
+  const [staged, setStaged] = useState<{ file: File; previewUrl: string | null } | null>(null);
+  const [fileError, setFileError] = useState<string | null>(null);
+  const [sendingFile, setSendingFile] = useState(false);
+  const [dragOver, setDragOver] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const stickRef = useRef(true);
   const messagesRef = useRef<ChatMessage[]>([]);
   const hasOlderRef = useRef(false);
@@ -64,6 +99,32 @@ export function ChatView({ channel }: { channel: Channel }) {
   useEffect(() => {
     messagesRef.current = messages;
   }, [messages]);
+
+  const clearStaged = useCallback(() => {
+    setStaged((prev) => {
+      if (prev?.previewUrl) URL.revokeObjectURL(prev.previewUrl);
+      return null;
+    });
+  }, []);
+
+  // Stage a file picked / pasted / dropped for the next message.
+  const stageFile = useCallback(
+    (file: File) => {
+      if (file.size > MAX_ATTACHMENT_BYTES) {
+        setFileError("File ta 3MB er beshi — pathano jabe na");
+        return;
+      }
+      setFileError(null);
+      setStaged((prev) => {
+        if (prev?.previewUrl) URL.revokeObjectURL(prev.previewUrl);
+        return {
+          file,
+          previewUrl: file.type.startsWith("image/") ? URL.createObjectURL(file) : null,
+        };
+      });
+    },
+    []
+  );
 
   // Merge fetched messages into state by id (incoming wins), ascending, no dupes.
   const mergeMessages = useCallback((incoming: ChatMessage[]) => {
@@ -176,6 +237,9 @@ export function ChatView({ channel }: { channel: Channel }) {
     setPending([]);
     setLoaded(false);
     setEditingId(null);
+    clearStaged();
+    setFileError(null);
+    setDragOver(false);
     stickRef.current = true;
     hasOlderRef.current = false;
     loadingOlderRef.current = false;
@@ -183,7 +247,7 @@ export function ChatView({ channel }: { channel: Channel }) {
     loadInitial();
     const t = setInterval(pollNew, 2000);
     return () => clearInterval(t);
-  }, [loadInitial, pollNew]);
+  }, [loadInitial, pollNew, clearStaged]);
 
   // Scroll management: after a history prepend, shift scrollTop by the
   // height delta so the visible messages do not move; otherwise keep the
@@ -214,8 +278,47 @@ export function ChatView({ channel }: { channel: Channel }) {
 
   const send = async () => {
     const text = draft.trim();
-    if (!text || !me) return;
+    if ((!text && !staged) || !me || sendingFile) return;
+    const fileToSend = staged?.file ?? null;
     setDraft("");
+    stickRef.current = true;
+
+    // Attachment path: the server assigns the attachment id, so there is no
+    // optimistic bubble — send body + file together, then merge the
+    // returned message like a resync.
+    if (fileToSend) {
+      setSendingFile(true);
+      try {
+        const dataBase64 = await readAsBase64(fileToSend);
+        const res = await fetch(`/api/channels/${channel.id}/messages`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            body: text,
+            attachment: {
+              filename: fileToSend.name || "file",
+              mimeType: fileToSend.type || "application/octet-stream",
+              dataBase64,
+            },
+          }),
+        });
+        if (!res.ok) {
+          const errData = await res.json().catch(() => null);
+          throw new Error(typeof errData?.error === "string" ? errData.error : "send failed");
+        }
+        const data = await res.json().catch(() => null);
+        clearStaged();
+        if (data?.message) mergeMessages([data.message]);
+      } catch (err) {
+        // Keep the staged file and restore the text so the user can retry.
+        setDraft(text);
+        setFileError(err instanceof Error && err.message !== "send failed" ? err.message : "File ta pathano jay ni — abar try koro");
+      } finally {
+        setSendingFile(false);
+      }
+      return;
+    }
+
     const temp: ChatMessage = {
       id: -Date.now(),
       channelId: channel.id,
@@ -224,6 +327,7 @@ export function ChatView({ channel }: { channel: Channel }) {
       pinned: false,
       editedAt: null,
       createdAt: new Date().toISOString(),
+      attachment: null,
       author: { id: me.id, name: me.name, kind: me.kind, role: me.role, color: me.color, avatar: me.avatar },
       reactions: [],
     };
@@ -301,7 +405,29 @@ export function ChatView({ channel }: { channel: Channel }) {
   const all = useMemo(() => [...messages, ...pending], [messages, pending]);
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col">
+    <div
+      className="relative flex min-h-0 flex-1 flex-col"
+      onDragOver={(e) => {
+        e.preventDefault();
+        setDragOver(true);
+      }}
+      onDragLeave={(e) => {
+        if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setDragOver(false);
+      }}
+      onDrop={(e) => {
+        e.preventDefault();
+        setDragOver(false);
+        const f = e.dataTransfer.files?.[0];
+        if (f) stageFile(f);
+      }}
+    >
+      {dragOver && (
+        <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center bg-brand-500/10">
+          <span className="rounded-xl bg-white px-4 py-2 text-sm font-semibold shadow-lg dark:bg-ink-800">
+            📎 Drop korlei file attach hobe
+          </span>
+        </div>
+      )}
       {/* Channel header */}
       <div className="border-b border-slate-200 px-4 py-3 dark:border-ink-700">
         <div className="flex items-baseline gap-2">
@@ -392,9 +518,14 @@ export function ChatView({ channel }: { channel: Channel }) {
                         </div>
                       </div>
                     ) : (
-                      <div className="msg-body text-[15px] leading-relaxed text-slate-800 dark:text-slate-100">
-                        {msg.body}
-                      </div>
+                      <>
+                        {msg.body && (
+                          <div className="msg-body text-[15px] leading-relaxed text-slate-800 dark:text-slate-100">
+                            {msg.body}
+                          </div>
+                        )}
+                        {msg.attachment && <MessageAttachment attachment={msg.attachment} />}
+                      </>
                     )}
 
                     {msg.reactions.length > 0 && (
@@ -469,7 +600,50 @@ export function ChatView({ channel }: { channel: Channel }) {
 
       {/* Composer */}
       <div className="border-t border-slate-200 p-3 dark:border-ink-700">
+        {fileError && <div className="mb-2 px-1 text-xs font-medium text-red-500">{fileError}</div>}
+        {staged && (
+          <div className="mb-2 flex items-center gap-2.5 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 dark:border-ink-600 dark:bg-ink-850">
+            {staged.previewUrl ? (
+              // eslint-disable-next-line @next/next/no-img-element
+              <img src={staged.previewUrl} alt="" className="h-10 w-10 rounded-lg object-cover" />
+            ) : (
+              <span className="text-xl">📄</span>
+            )}
+            <span className="min-w-0 flex-1">
+              <span className="block truncate text-sm font-medium">{staged.file.name || "file"}</span>
+              <span className="block text-xs text-slate-400">{formatSize(staged.file.size)}</span>
+            </span>
+            {sendingFile && <span className="text-xs text-slate-400">Pathano hocche…</span>}
+            <button
+              onClick={clearStaged}
+              disabled={sendingFile}
+              className="rounded-lg px-2 py-1 text-sm text-slate-500 transition hover:bg-slate-200 disabled:opacity-40 dark:hover:bg-ink-700"
+              title="Remove attachment"
+            >
+              ✕
+            </button>
+          </div>
+        )}
         <div className="flex items-end gap-2 rounded-2xl border border-slate-300 bg-white px-3 py-2 shadow-sm transition focus-within:border-brand-500 dark:border-ink-600 dark:bg-ink-800">
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept={ACCEPT_TYPES}
+            className="hidden"
+            onChange={(e) => {
+              const f = e.target.files?.[0];
+              if (f) stageFile(f);
+              e.target.value = "";
+            }}
+          />
+          <button
+            type="button"
+            onClick={() => fileInputRef.current?.click()}
+            className="rounded-lg px-1.5 py-1 text-lg transition hover:bg-slate-100 dark:hover:bg-ink-700"
+            title="Attach a picture or document (max 3 MB)"
+          >
+            📎
+          </button>
           <textarea
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
@@ -482,17 +656,60 @@ export function ChatView({ channel }: { channel: Channel }) {
                 send();
               }
             }}
+            onPaste={(e) => {
+              const items = e.clipboardData?.items;
+              if (!items) return;
+              for (const item of items) {
+                if (item.kind === "file") {
+                  const f = item.getAsFile();
+                  if (f) {
+                    e.preventDefault();
+                    stageFile(f);
+                    break;
+                  }
+                }
+              }
+            }}
           />
           <button
             onClick={send}
-            disabled={!draft.trim()}
+            disabled={(!draft.trim() && !staged) || sendingFile}
             className="rounded-xl bg-brand-500 px-3.5 py-2 text-sm font-semibold text-white shadow-sm transition enabled:hover:bg-brand-600 enabled:active:scale-95 disabled:opacity-40"
           >
-            Send
+            {sendingFile ? "…" : "Send"}
           </button>
         </div>
       </div>
     </div>
+  );
+}
+
+function MessageAttachment({ attachment }: { attachment: ChatAttachment }) {
+  const url = `/api/attachments/${attachment.id}`;
+  if (attachment.mimeType.startsWith("image/")) {
+    return (
+      <a href={url} target="_blank" rel="noreferrer" className="mt-1.5 block w-fit">
+        {/* eslint-disable-next-line @next/next/no-img-element */}
+        <img
+          src={url}
+          alt={attachment.filename}
+          className="max-h-80 max-w-[320px] rounded-xl border border-slate-200 object-contain dark:border-ink-600"
+          loading="lazy"
+        />
+      </a>
+    );
+  }
+  return (
+    <a
+      href={url}
+      className="mt-1.5 flex w-fit max-w-sm items-center gap-3 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 transition hover:border-slate-300 hover:bg-slate-100 dark:border-ink-600 dark:bg-ink-850 dark:hover:bg-ink-800"
+    >
+      <span className="text-2xl">📄</span>
+      <span className="min-w-0">
+        <span className="block truncate text-sm font-medium">{attachment.filename}</span>
+        <span className="block text-xs text-slate-400">{formatSize(attachment.size)} · download</span>
+      </span>
+    </a>
   );
 }
 

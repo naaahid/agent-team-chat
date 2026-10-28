@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/db";
 import { requireSeat } from "@/lib/guard";
-import { ALLOWED_EMOJIS, toMessageDTO } from "@/lib/serialize";
+import { ALLOWED_EMOJIS, MESSAGE_INCLUDE, toMessageDTO } from "@/lib/serialize";
 
 type Params = { params: Promise<{ id: string }> };
 
@@ -28,7 +28,7 @@ export async function POST(req: Request, { params }: Params) {
   }
   const fresh = await prisma.message.findUnique({
     where: { id },
-    include: { author: true, reactions: true },
+    include: MESSAGE_INCLUDE,
   });
   return NextResponse.json({ message: toMessageDTO(fresh!, seat.id) });
 }
