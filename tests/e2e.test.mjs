@@ -253,6 +253,53 @@ test("daily update posts and lists", async () => {
   assert.ok(list.json.updates.some((u) => u.id === posted.json.update.id));
 });
 
+test("channel history windows: latest default, before-cursor, after-cursor", async () => {
+  // Dedicated channel so its windows are exact and isolated.
+  const chRes = await owner("POST", "/api/channels", {
+    name: "history-test",
+    topic: "window tests",
+  });
+  assert.equal(chRes.status, 201);
+  const chId = chRes.json.channel.id;
+
+  let lastPostedId = 0;
+  for (let i = 1; i <= 12; i++) {
+    const m = await owner("POST", `/api/channels/${chId}/messages`, { body: `history ${i}` });
+    assert.equal(m.status, 201);
+    lastPostedId = m.json.message.id;
+  }
+
+  // Ground truth: the whole channel (12 posts + channel-created system note),
+  // ascending, ending at the last posted message.
+  const all = await owner("GET", `/api/channels/${chId}/messages`);
+  assert.equal(all.status, 200);
+  const allIds = all.json.messages.map((m) => m.id);
+  assert.ok(allIds.length >= 12);
+  assert.equal(allIds[allIds.length - 1], lastPostedId);
+  assert.ok(allIds.every((v, i) => i === 0 || allIds[i - 1] < v), "default page is ascending");
+
+  // (a) A limited default GET returns the LATEST window, not the first one.
+  const latest = await owner("GET", `/api/channels/${chId}/messages?limit=5`);
+  assert.deepEqual(latest.json.messages.map((m) => m.id), allIds.slice(-5));
+
+  // (b) ?before returns the window CLOSEST below the cursor, ascending.
+  const cursor = allIds[allIds.length - 5];
+  const older = await owner("GET", `/api/channels/${chId}/messages?before=${cursor}&limit=5`);
+  assert.deepEqual(older.json.messages.map((m) => m.id), allIds.slice(-10, -5));
+  // One more hop up reaches the head of the channel.
+  const head = await owner(
+    "GET",
+    `/api/channels/${chId}/messages?before=${allIds[allIds.length - 10]}&limit=5`
+  );
+  assert.deepEqual(head.json.messages.map((m) => m.id), allIds.slice(0, allIds.length - 10));
+
+  // (c) ?after returns only newer messages.
+  const none = await owner("GET", `/api/channels/${chId}/messages?after=${lastPostedId}`);
+  assert.deepEqual(none.json.messages, []);
+  const newer = await owner("GET", `/api/channels/${chId}/messages?after=${allIds[7]}`);
+  assert.deepEqual(newer.json.messages.map((m) => m.id), allIds.slice(8));
+});
+
 test("owner can assign the Leader badge", async () => {
   const overview = await owner("GET", "/api/admin/overview");
   const memberSeat = overview.json.seats.find((s) => s.name === "Rahim's Muse");

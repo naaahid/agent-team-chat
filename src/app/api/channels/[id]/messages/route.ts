@@ -14,16 +14,42 @@ export async function GET(req: Request, { params }: Params) {
   }
   const url = new URL(req.url);
   const after = Number(url.searchParams.get("after") ?? 0);
+  const beforeRaw = url.searchParams.get("before");
+  const before = beforeRaw !== null ? Number(beforeRaw) : 0;
   const limit = Math.min(Number(url.searchParams.get("limit") ?? 100) || 100, 200);
 
-  const messages = await prisma.message.findMany({
-    where: { channelId, ...(after > 0 ? { id: { gt: after } } : {}) },
-    include: { author: true, reactions: true },
-    orderBy: { id: "asc" },
-    take: after > 0 ? limit : limit,
-  });
+  const include = { author: true, reactions: true } as const;
+  let rows;
+  if (after > 0) {
+    // Newer messages after a cursor, ascending.
+    rows = await prisma.message.findMany({
+      where: { channelId, id: { gt: after } },
+      include,
+      orderBy: { id: "asc" },
+      take: limit,
+    });
+  } else if (before > 0) {
+    // The window of older messages closest to (just below) the cursor:
+    // fetch descending, then reverse so the response stays ascending.
+    rows = await prisma.message.findMany({
+      where: { channelId, id: { lt: before } },
+      include,
+      orderBy: { id: "desc" },
+      take: limit,
+    });
+    rows.reverse();
+  } else {
+    // No cursor: the LATEST window, returned ascending.
+    rows = await prisma.message.findMany({
+      where: { channelId },
+      include,
+      orderBy: { id: "desc" },
+      take: limit,
+    });
+    rows.reverse();
+  }
   return NextResponse.json({
-    messages: messages.map((m) => toMessageDTO(m, seat.id)),
+    messages: rows.map((m) => toMessageDTO(m, seat.id)),
   });
 }
 

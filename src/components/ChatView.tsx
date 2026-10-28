@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useSession } from "./SessionProvider";
 import { Avatar, RoleBadge, formatDay, formatTime } from "./Avatar";
 import type { Channel } from "./AppShell";
@@ -27,6 +27,13 @@ export type ChatMessage = {
 
 const EMOJIS = ["👍", "❤️", "🔥", "😂", "👀"];
 
+// History page size: opening a channel loads the latest PAGE_SIZE messages;
+// scrolling to the top auto-loads the previous window of the same size.
+const PAGE_SIZE = 100;
+
+// useLayoutEffect that falls back to useEffect during SSR.
+const useIsoLayoutEffect = typeof window !== "undefined" ? useLayoutEffect : useEffect;
+
 function sameDay(a: string, b: string) {
   const da = new Date(a);
   const db = new Date(b);
@@ -48,13 +55,37 @@ export function ChatView({ channel }: { channel: Channel }) {
   const [hoverId, setHoverId] = useState<number | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const stickRef = useRef(true);
+  const messagesRef = useRef<ChatMessage[]>([]);
+  const hasOlderRef = useRef(false);
+  const loadingOlderRef = useRef(false);
+  const restoreRef = useRef<{ prevHeight: number } | null>(null);
+  const activeChannelRef = useRef(channel.id);
 
-  const fetchMessages = useCallback(async () => {
+  useEffect(() => {
+    messagesRef.current = messages;
+  }, [messages]);
+
+  // Merge fetched messages into state by id (incoming wins), ascending, no dupes.
+  const mergeMessages = useCallback((incoming: ChatMessage[]) => {
+    if (!incoming.length) return;
+    setMessages((prev) => {
+      const byId = new Map<number, ChatMessage>();
+      for (const m of prev) byId.set(m.id, m);
+      for (const m of incoming) byId.set(m.id, m);
+      return [...byId.values()].sort((a, b) => a.id - b.id);
+    });
+  }, []);
+
+  // Initial load: the API's default page is the LATEST window.
+  const loadInitial = useCallback(async () => {
     try {
-      const res = await fetch(`/api/channels/${channel.id}/messages`, { cache: "no-store" });
-      if (res.ok) {
+      const res = await fetch(`/api/channels/${channel.id}/messages?limit=${PAGE_SIZE}`, {
+        cache: "no-store",
+      });
+      if (res.ok && activeChannelRef.current === channel.id) {
         const data = await res.json();
         setMessages(data.messages);
+        hasOlderRef.current = data.messages.length >= PAGE_SIZE;
         setLoaded(true);
       }
     } catch {
@@ -62,20 +93,112 @@ export function ChatView({ channel }: { channel: Channel }) {
     }
   }, [channel.id]);
 
+  // Live polling: only messages newer than the newest one already loaded,
+  // appended via the id merge. While nothing is loaded yet, fall back to
+  // the latest-window fetch so an empty channel picks up its first message.
+  const pollNew = useCallback(async () => {
+    const current = messagesRef.current;
+    const newest = current.length ? current[current.length - 1].id : 0;
+    try {
+      const url =
+        newest > 0
+          ? `/api/channels/${channel.id}/messages?after=${newest}`
+          : `/api/channels/${channel.id}/messages?limit=${PAGE_SIZE}`;
+      const res = await fetch(url, { cache: "no-store" });
+      if (res.ok && activeChannelRef.current === channel.id) {
+        const data = await res.json();
+        if (data.messages.length) {
+          if (newest > 0) {
+            mergeMessages(data.messages);
+          } else {
+            setMessages(data.messages);
+            hasOlderRef.current = data.messages.length >= PAGE_SIZE;
+          }
+          setLoaded(true);
+        }
+      }
+    } catch {
+      // retry on next poll
+    }
+  }, [channel.id, mergeMessages]);
+
+  // After a local mutation (react / pin / edit / delete), resync the newest
+  // window and merge it in, so counts and edits refresh without discarding
+  // older history the user has scrolled up through.
+  const refreshLatest = useCallback(async () => {
+    try {
+      const res = await fetch(`/api/channels/${channel.id}/messages?limit=200`, {
+        cache: "no-store",
+      });
+      if (res.ok && activeChannelRef.current === channel.id) {
+        const data = await res.json();
+        mergeMessages(data.messages);
+      }
+    } catch {
+      // optimistic state already applied
+    }
+  }, [channel.id, mergeMessages]);
+
+  // Infinite scroll up: fetch the window just older than the oldest loaded
+  // message, prepend it via the merge, and remember the scroll height so
+  // the layout effect can restore the exact reading position (no jump).
+  const loadOlder = useCallback(async () => {
+    const el = scrollRef.current;
+    const current = messagesRef.current;
+    if (!el || loadingOlderRef.current || !hasOlderRef.current || current.length === 0) return;
+    const oldest = current[0].id;
+    if (oldest <= 0) return;
+    loadingOlderRef.current = true;
+    try {
+      const res = await fetch(
+        `/api/channels/${channel.id}/messages?before=${oldest}&limit=${PAGE_SIZE}`,
+        { cache: "no-store" }
+      );
+      if (res.ok && activeChannelRef.current === channel.id) {
+        const data = await res.json();
+        const older: ChatMessage[] = data.messages;
+        hasOlderRef.current = older.length >= PAGE_SIZE;
+        if (older.length > 0) {
+          restoreRef.current = { prevHeight: el.scrollHeight };
+          mergeMessages(older);
+        }
+      }
+    } catch {
+      // a later scroll near the top can retry
+    } finally {
+      loadingOlderRef.current = false;
+    }
+  }, [channel.id, mergeMessages]);
+
   useEffect(() => {
+    activeChannelRef.current = channel.id;
     setMessages([]);
     setPending([]);
     setLoaded(false);
+    setEditingId(null);
     stickRef.current = true;
-    fetchMessages();
-    const t = setInterval(fetchMessages, 2000);
+    hasOlderRef.current = false;
+    loadingOlderRef.current = false;
+    restoreRef.current = null;
+    loadInitial();
+    const t = setInterval(pollNew, 2000);
     return () => clearInterval(t);
-  }, [fetchMessages]);
+  }, [loadInitial, pollNew]);
 
-  // Auto-scroll when new content arrives and the user is near the bottom.
-  useEffect(() => {
+  // Scroll management: after a history prepend, shift scrollTop by the
+  // height delta so the visible messages do not move; otherwise keep the
+  // view pinned to the bottom while the user is already near it (and never
+  // yank them down while they are scrolled up reading history).
+  useIsoLayoutEffect(() => {
     const el = scrollRef.current;
-    if (el && stickRef.current) {
+    if (!el) return;
+    if (restoreRef.current) {
+      const delta = el.scrollHeight - restoreRef.current.prevHeight;
+      restoreRef.current = null;
+      if (delta !== 0) el.scrollTop = el.scrollTop + delta;
+      return;
+    }
+    if (stickRef.current) {
       el.scrollTop = el.scrollHeight;
     }
   }, [messages, pending]);
@@ -84,6 +207,9 @@ export function ChatView({ channel }: { channel: Channel }) {
     const el = scrollRef.current;
     if (!el) return;
     stickRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 120;
+    if (el.scrollTop < 100) {
+      void loadOlder();
+    }
   };
 
   const send = async () => {
@@ -110,8 +236,9 @@ export function ChatView({ channel }: { channel: Channel }) {
         body: JSON.stringify({ body: text }),
       });
       if (!res.ok) throw new Error("send failed");
+      const data = await res.json().catch(() => null);
       setPending((p) => p.filter((m) => m.id !== temp.id));
-      await fetchMessages();
+      if (data?.message) mergeMessages([data.message]);
     } catch {
       setPending((p) =>
         p.map((m) => (m.id === temp.id ? { ...m, body: m.body + "  ⚠️ (failed to send — check connection)" } : m))
@@ -143,13 +270,13 @@ export function ChatView({ channel }: { channel: Channel }) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ emoji }),
     }).catch(() => {});
-    fetchMessages();
+    refreshLatest();
   };
 
   const togglePin = async (msg: ChatMessage) => {
     setMessages((prev) => prev.map((m) => (m.id === msg.id ? { ...m, pinned: !m.pinned } : m)));
     await fetch(`/api/messages/${msg.id}/pin`, { method: "POST" }).catch(() => {});
-    fetchMessages();
+    refreshLatest();
   };
 
   const saveEdit = async (msg: ChatMessage) => {
@@ -161,14 +288,14 @@ export function ChatView({ channel }: { channel: Channel }) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ body: text }),
     }).catch(() => {});
-    fetchMessages();
+    refreshLatest();
   };
 
   const remove = async (msg: ChatMessage) => {
     if (!confirm("Delete this message?")) return;
     setMessages((prev) => prev.filter((m) => m.id !== msg.id));
     await fetch(`/api/messages/${msg.id}`, { method: "DELETE" }).catch(() => {});
-    fetchMessages();
+    refreshLatest();
   };
 
   const all = useMemo(() => [...messages, ...pending], [messages, pending]);
